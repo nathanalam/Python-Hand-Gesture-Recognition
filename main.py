@@ -1,4 +1,5 @@
 import cv2
+import math
 import time
 from collections import deque
 import mediapipe as mp
@@ -19,17 +20,13 @@ MAX_TRAIL: Final[int] = 5
 LEFT_SMOOTHING_ALPHA: Final[float] = 0.35   # EMA smoothing for left hand
 RIGHT_SMOOTHING_ALPHA: Final[float] = 0.55  # slightly snappier for right hand chop
 
-LEFT_SWIPE_MIN_DIST: Final[int] = 120     # pixels horizontal displacement threshold
-LEFT_SWIPE_MAX_Y_DEV: Final[int] = 60     # pixels vertical tolerance while swiping
-LEFT_SWIPE_MIN_SPEED: Final[int] = 400    # pixels/second minimal speed for swipe
-
-# Right-hand chop thresholds
-CHOP_MIN_SPEED: Final[int] = 450          # pixels/second downward speed for chop
-CHOP_MIN_DIST: Final[int] = 80            # minimal downward displacement in pixels
-CHOP_MAX_X_DEV: Final[int] = 140          # horizontal tolerance while chopping
+# Old gesture detection constants removed - now using continuous tracking
 
 # For overlay persistence
 OVERLAY_DURATION_SEC: Final[float] = 0.8
+
+# Game visual settings
+BACKGROUND_COLOR: Final[Tuple[int, int, int]] = (20, 40, 20)  # dark green
 
 # Drawing helpers
 ARROW_COLOR: Final[Tuple[int, int, int]] = (0, 255, 255)  # yellow
@@ -121,24 +118,19 @@ class GameState:
         self.cuke_y: int = int(frame_h * 0.75)
         self.cuke_w: int = int(frame_w * 0.18)
         self.cuke_h: int = int(frame_h * 0.08)
-        self.knife_active: bool = False
-        self.knife_until: float = 0.0
-        self.slice_until: float = 0.0
+        self.bang_until: float = 0.0
 
     def move_cucumber_to(self, x: int) -> None:
         half = self.cuke_w // 2
         self.cuke_x = max(half, min(self.w - half, x))
 
-    def trigger_knife(self, duration: float = 0.18) -> None:
-        self.knife_active = True
-        self.knife_until = time.time() + duration
+    def trigger_bang(self, duration: float = 0.3) -> None:
+        self.bang_until = time.time() + duration
 
     def update(self) -> None:
         t = time.time()
-        if self.knife_active and t > self.knife_until:
-            self.knife_active = False
-        if self.slice_until and t > self.slice_until:
-            self.slice_until = 0.0
+        if self.bang_until and t > self.bang_until:
+            self.bang_until = 0.0
 
     def hit_test(self, knife_rect: Tuple[int, int, int, int]) -> bool:
         kx, ky, kw, kh = knife_rect
@@ -173,38 +165,7 @@ def is_left(handedness: Any) -> bool:
     # MediaPipe Hands uses label 'Left' for the person's left hand
     return handedness.classification[0].label == 'Left'
 
-# Gesture detectors
-def detect_left_hand_swipe(anchor: HandAnchor, frame_w: int, frame_h: int) -> Optional[Literal['left', 'right']]:
-    dx, dy, dt = anchor.motion.displacement()
-    if dt <= 0.0:
-        return None
-    speed_x = abs(dx) / dt
-    if abs(dy) > LEFT_SWIPE_MAX_Y_DEV:
-        return None
-    if speed_x < LEFT_SWIPE_MIN_SPEED:
-        return None
-    if abs(dx) < LEFT_SWIPE_MIN_DIST:
-        return None
-    return 'right' if dx > 0 else 'left'
-
-def detect_right_hand_chop(anchor: HandAnchor) -> bool:
-    # Favor recent movement to detect quick chops
-    rdx, rdy, rdt = anchor.recent_displacement(n=3)
-    if rdt <= 0.0:
-        return False
-    r_speed_y = rdy / rdt
-
-    # Fall back to whole-trail if needed
-    dx, dy, dt = anchor.motion.displacement()
-    speed_y = dy / dt if dt > 0 else 0.0
-
-    if max(r_speed_y, speed_y) < CHOP_MIN_SPEED:
-        return False
-    if max(rdy, dy) < CHOP_MIN_DIST:
-        return False
-    if abs(max(rdx, dx, key=abs)) > CHOP_MAX_X_DEV:
-        return False
-    return True
+# Old gesture detection functions removed - now using continuous tracking
 
 def draw_cucumber(img: Any, gs: GameState) -> None:
     x, y = gs.cuke_x, gs.cuke_y
@@ -221,24 +182,43 @@ def draw_knife(img: Any, gs: GameState, right_anchor: HandAnchor) -> None:
     blade_w = int(0.12 * w)
     blade_h = int(0.18 * h)
     handle_h = int(0.06 * h)
+    
+    # Position knife at right hand's position
     x = min(max(0, right_anchor.last_x - blade_w // 2), w - blade_w)
-    y_start = int(0.02 * h)
-    y_drop = int(0.12 * h)
-    if gs.knife_active:
-        y_start += y_drop
+    y_start = max(0, min(h - blade_h - handle_h, right_anchor.last_y - blade_h // 2))
     y_end = y_start + blade_h
-    if gs.knife_active:
-        cv2.rectangle(img, (x, y_start), (x + blade_w, y_end), (230, 230, 230), -1)
-        cv2.rectangle(img, (x, y_start), (x + blade_w, y_end), (160, 160, 160), 3)
-        cv2.rectangle(img, (x + blade_w // 3, y_end), (x + 2 * blade_w // 3, y_end + handle_h), (50, 50, 50), -1)
-        if gs.hit_test((x, y_start, blade_w, y_end - y_start)):
-            gs.slice_until = max(gs.slice_until, time.time() + 0.25)
-    if gs.slice_until and time.time() < gs.slice_until:
-        cv2.line(img, (gs.cuke_x - gs.cuke_w // 2, gs.cuke_y), (gs.cuke_x + gs.cuke_w // 2, gs.cuke_y), (0, 0, 255), 6)
+    
+    # Always draw the knife
+    cv2.rectangle(img, (x, y_start), (x + blade_w, y_end), (230, 230, 230), -1)
+    cv2.rectangle(img, (x, y_start), (x + blade_w, y_end), (160, 160, 160), 3)
+    cv2.rectangle(img, (x + blade_w // 3, y_end), (x + 2 * blade_w // 3, y_end + handle_h), (50, 50, 50), -1)
+    
+    # Check for collision and trigger bang effect
+    if gs.hit_test((x, y_start, blade_w, blade_h)):
+        gs.trigger_bang()
+
+def draw_bang(img: Any, gs: GameState) -> None:
+    if gs.bang_until and time.time() < gs.bang_until:
+        x, y = gs.cuke_x, gs.cuke_y
+        # Draw starburst/bang effect
+        colors = [(255, 255, 0), (255, 150, 0), (255, 0, 0)]  # yellow to red
+        for i, color in enumerate(colors):
+            radius = 40 + i * 15
+            thickness = 8 - i * 2
+            cv2.circle(img, (x, y), radius, color, thickness)
+        
+        # Draw radiating lines
+        for angle in range(0, 360, 45):
+            rad = math.radians(angle)
+            start_x = x + int(25 * math.cos(rad))
+            start_y = y + int(25 * math.sin(rad))
+            end_x = x + int(60 * math.cos(rad))
+            end_y = y + int(60 * math.sin(rad))
+            cv2.line(img, (start_x, start_y), (end_x, end_y), (255, 255, 255), 4)
 
 def draw_hud(img: Any) -> None:
-    cv2.putText(img, 'Left hand moves cucumber. Right hand chop to slice. Press x to exit.', (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+    cv2.putText(img, 'Gesture Control: Left hand moves cucumber, Right hand controls knife. Press x to exit.', (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (230, 230, 230), 2)
 
 # --- Run ---
 cv2.destroyAllWindows()
@@ -258,12 +238,18 @@ with mp_hands.Hands(
     min_tracking_confidence=0.5,
 ) as hands:
     while True:
-        ret, frame = cap.read()
+        # Still capture webcam for hand tracking, but don't use it as background
+        ret, webcam_frame = cap.read()
         if not ret:
             break
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-        frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Create solid background for game
+        frame = np.full((FRAME_HEIGHT, FRAME_WIDTH, 3), BACKGROUND_COLOR, dtype=np.uint8)
+        
+        # Process webcam for hand detection (flipped for mirror effect)
+        webcam_frame = cv2.resize(webcam_frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        webcam_frame = cv2.flip(webcam_frame, 1)
+        rgb = cv2.cvtColor(webcam_frame, cv2.COLOR_BGR2RGB)
         t_now = time.time()
         results = hands.process(rgb)
         if results.multi_hand_landmarks and results.multi_handedness:
@@ -273,22 +259,14 @@ with mp_hands.Hands(
                     left_anchor.update(anchor_lm, FRAME_WIDTH, FRAME_HEIGHT, t_now)
                 else:
                     right_anchor.update(anchor_lm, FRAME_WIDTH, FRAME_HEIGHT, t_now)
-                mp_drawing.draw_landmarks(
-                    frame,
-                    hand_lms,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_styles.get_default_hand_landmarks_style(),
-                    mp_styles.get_default_hand_connections_style(),
-                )
         if len(left_anchor.motion.points) > 0:
             gs.move_cucumber_to(left_anchor.last_x)
-        if detect_right_hand_chop(right_anchor):
-            gs.trigger_knife()
         gs.update()
         draw_cucumber(frame, gs)
         draw_knife(frame, gs, right_anchor)
+        draw_bang(frame, gs)
         draw_hud(frame)
-        cv2.imshow('Cucumber Slicer (1-cell)', frame)
+        cv2.imshow('Cucumber Slicer Game', frame.astype(np.uint8))
         if (cv2.waitKey(1) & 0xFF) == ord('x'):
             break
 cap.release()
